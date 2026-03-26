@@ -1,0 +1,33 @@
+{
+  "totalTimeMs": 8697,
+  "docsPerSecond": 115,
+  "peakMemoryMB": 85,
+  "failedCount": 0,
+  "successCount": 0,
+  "timeline": [
+    {
+      "timestamp": "2026-03-26T19:06:06.323Z",
+      "processed": 0,
+      "failed": 0,
+      "docsPerSec": 0
+    },
+    {
+      "timestamp": "2026-03-26T19:06:08.386Z",
+      "processed": 0,
+      "failed": 0,
+      "docsPerSec": 0
+    },
+    {
+      "timestamp": "2026-03-26T19:06:10.440Z",
+      "processed": 0,
+      "failed": 0,
+      "docsPerSec": 0
+    },
+    {
+      "timestamp": "2026-03-26T19:06:12.468Z",
+      "processed": 0,
+      "failed": 0,
+      "docsPerSec": 0
+    }
+  ]
+}

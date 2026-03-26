@@ -1,0 +1,1225 @@
+================================================================================
+  TODO DÉTAILLÉ — TEST BACKEND NODE.JS 24H
+  Architecture Producer-Consumer | Bull + Redis | MongoDB + GridFS
+  Worker Threads | Prometheus | Clean Architecture
+================================================================================
+
+
+================================================================================
+  STRUCTURE DES DOSSIERS
+================================================================================
+
+/src
+  /api
+    /controllers
+      batchController.ts
+      documentController.ts
+    /routes
+      batchRoutes.ts
+      documentRoutes.ts
+    /middlewares
+      validate.ts
+      rateLimiter.ts
+      errorHandler.ts
+  /domain
+    /services
+      batchService.ts
+      documentService.ts
+      queueService.ts
+    /models
+      Batch.ts
+      Document.ts
+  /infrastructure
+    /queue
+      bullConfig.ts
+      queueAdapter.ts         <- Pattern Strategy (Bull | Memory fallback)
+      memoryQueue.ts          <- Fallback Redis down
+    /storage
+      gridfsStorage.ts
+      mongoConnection.ts
+    /monitoring
+      prometheus.ts
+      healthcheck.ts
+      circuitBreaker.ts
+  /workers
+    /processors
+      pdfProcessor.ts         <- Tourne dans un Worker Thread
+    workerPool.ts             <- Gestion Piscina / worker_threads
+  /config
+    env.ts
+    logger.ts
+  app.ts                      <- Point d'entrée API (Producer)
+  worker.ts                   <- Point d'entrée Worker (Consumer)
+
+/benchmark
+  run.ts
+
+================================================================================
+  CONCEPTION BASE DE DONNÉES (MongoDB)
+================================================================================
+
+------------------------------------------------------------------------
+Collection : "batches"
+------------------------------------------------------------------------
+
+Schema :
+{
+  _id          : ObjectId         — identifiant interne MongoDB
+  batchId      : string           — UUID v4, retourné immédiatement au client
+  status       : enum             — "pending" | "processing" | "completed" | "failed"
+  totalDocuments : number         — toujours 1000 dans le sujet
+  processedCount : number         — compteur atomique incrémenté par les workers ($inc)
+  failedCount  : number           — compteur des échecs définitifs
+  userIds      : string[]         — tableau des 1000 userIds reçus
+  createdAt    : Date             — géré automatiquement (timestamps: true)
+  updatedAt    : Date             — géré automatiquement (timestamps: true)
+  completedAt  : Date | null      — rempli quand status passe à "completed"/"failed"
+  metadata     : {
+    requestIp  : string
+    userAgent  : string
+  }
+}
+
+Index à créer :
+  db.batches.createIndex({ batchId: 1 }, { unique: true })
+  db.batches.createIndex({ status: 1 })
+  db.batches.createIndex({ createdAt: -1 })
+
+------------------------------------------------------------------------
+Collection : "documents"
+------------------------------------------------------------------------
+
+Schema :
+{
+  _id              : ObjectId
+  documentId       : string         — UUID v4, identifiant public du document
+  batchId          : string         — référence vers le batch parent
+  userId           : string         — le userId pour lequel le PDF est généré
+  status           : enum           — "pending" | "processing" | "completed" | "failed"
+  gridfsFileId     : ObjectId|null  — référence vers le fichier dans GridFS
+  fileSize         : number|null    — taille en octets du PDF généré
+  retryCount       : number         — nombre de tentatives (max 3)
+  errorMessage     : string|null    — message d'erreur si échec final
+  generationTimeMs : number|null    — durée de génération en ms (observabilité)
+  createdAt        : Date
+  updatedAt        : Date
+}
+
+Index à créer :
+  db.documents.createIndex({ documentId: 1 }, { unique: true })
+  db.documents.createIndex({ batchId: 1 })
+  db.documents.createIndex({ batchId: 1, status: 1 })
+  db.documents.createIndex({ userId: 1 })
+
+------------------------------------------------------------------------
+GridFS : bucket "pdfs" (collections pdfs.files et pdfs.chunks)
+------------------------------------------------------------------------
+
+Chaque fichier stocké avec :
+{
+  filename      : "${documentId}.pdf"
+  contentType   : "application/pdf"
+  chunkSizeBytes: 261120              — 255 KB par chunk (défaut GridFS)
+  metadata      : {
+    documentId  : string
+    batchId     : string
+    userId      : string
+    generatedAt : Date
+  }
+}
+
+Note : Le bucket s'appelle "pdfs" (pas le bucket "fs" par défaut) pour
+       isoler les fichiers PDF des autres éventuels fichiers GridFS.
+
+
+================================================================================
+  RÉCAPITULATIF DES ENDPOINTS
+================================================================================
+
+  POST  /api/documents/batch           Créer un batch de 1000 docs
+                                       Codes : 202, 400, 429, 500
+
+  GET   /api/documents/batch/:batchId  Status + liste des docs du batch
+                                       Codes : 200, 400, 404, 500
+
+  GET   /api/documents/:documentId     Télécharger un PDF généré (stream)
+                                       Codes : 200, 202, 400, 404
+
+  GET   /health                        Health check MongoDB + Redis + Queue
+                                       Codes : 200, 503
+
+  GET   /metrics                       Métriques Prometheus
+                                       Codes : 200
+
+  GET   /api-docs                      Interface Swagger UI
+                                       Codes : 200
+
+
+================================================================================
+  PHASE 0 — SETUP PROJET
+================================================================================
+
+[ ] Initialiser le repo Git + .gitignore (node_modules, dist, .env)
+[ ] Initialiser le projet TypeScript
+      - tsconfig.json avec strict: true, target: ES2020, moduleResolution: node
+      - outDir: ./dist, rootDir: ./src
+[ ] Installer les dépendances principales :
+      express bull ioredis mongoose uuid pdfkit piscina
+      joi zod winston prom-client express-rate-limit helmet
+      swagger-ui-express swagger-jsdoc opossum
+      @types/express @types/node @types/uuid typescript ts-node
+[ ] Configurer ESLint + Prettier
+      - Plugin TypeScript strict
+      - Règle no-explicit-any activée
+      - Règle no-unused-vars activée
+[ ] Créer /src/config/env.ts
+      - Lire toutes les variables d'environnement via Zod
+      - Variables requises : PORT, MONGO_URI, REDIS_URL,
+        WORKER_CONCURRENCY, PDF_TIMEOUT_MS, LOG_LEVEL
+      - Throw au démarrage si une variable obligatoire est absente
+      - Export d'un objet "config" typé et validé
+[ ] Créer /src/config/logger.ts
+      - Winston avec format JSON
+      - Champs standards : timestamp, level, message
+      - Champs contextuels optionnels : batchId, documentId, userId,
+        durationMs, error
+      - Transport Console en dev, File en prod
+[ ] Créer docker-compose.yml
+      - Service "mongodb" : image mongo:7, volume persistant, healthcheck
+      - Service "redis"   : image redis:7, --maxmemory-policy allkeys-lru
+      - Service "api"     : build depuis app.ts, port 3000
+      - Service "worker"  : build depuis worker.ts, scalable
+      - Réseau Docker commun "app-network"
+[ ] Créer .env.example documenté avec toutes les variables
+
+
+================================================================================
+  PHASE 1 — BASE DE DONNÉES ET INFRASTRUCTURE
+================================================================================
+
+------------------------------------------------------------------------
+1.1 — Connexion MongoDB
+Fichier : /src/infrastructure/storage/mongoConnection.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter connect(): Promise<void>
+      - Appelle mongoose.connect() avec l'URI depuis config
+      - Options : serverSelectionTimeoutMS: 5000, maxPoolSize: 10
+      - Log "MongoDB connecté" avec logger à la connexion réussie
+      - Émet event "db:connected" pour signaler la disponibilité
+      - Retry automatique avec backoff exponentiel (max 5 tentatives)
+        Délais : 1s, 2s, 4s, 8s, 16s
+      - Si 5 échecs : log erreur critique, process.exit(1)
+
+[ ] Implémenter disconnect(): Promise<void>
+      - Appelle mongoose.connection.close()
+      - Appelé dans le Graceful Shutdown
+      - Log "MongoDB déconnecté"
+
+[ ] Écouter les events Mongoose :
+      - mongoose.connection.on('error', ...) : logger l'erreur
+      - mongoose.connection.on('disconnected', ...) : logger warning
+      - mongoose.connection.on('reconnected', ...) : logger info
+
+[ ] Exporter flag isMongoAvailable: boolean
+      - Mis à true après connexion réussie
+      - Mis à false après déconnexion
+      - Consulté par le health check et l'error handler
+
+------------------------------------------------------------------------
+1.2 — Modèle Batch
+Fichier : /src/domain/models/Batch.ts
+------------------------------------------------------------------------
+
+[ ] Définir l'interface IBatch avec tous les champs du schema BDD
+
+[ ] Définir BatchSchema avec Mongoose
+      - Tous les champs typés
+      - status : enum strict ["pending","processing","completed","failed"]
+      - timestamps: true pour createdAt/updatedAt automatiques
+      - Valeurs par défaut : processedCount: 0, failedCount: 0,
+        completedAt: null
+
+[ ] Ajouter méthode d'instance isComplete(): boolean
+      - Retourne true si processedCount + failedCount >= totalDocuments
+      - Utilisée par updateBatchProgress pour détecter la fin du batch
+
+[ ] Ajouter méthode statique findByBatchId(batchId: string)
+      - Projection optimisée : exclure le champ "userIds" (1000 strings)
+        pour les requêtes de status (économise de la mémoire)
+      - Retourne null si non trouvé
+
+[ ] Exporter BatchModel et l'interface IBatch
+
+------------------------------------------------------------------------
+1.3 — Modèle Document
+Fichier : /src/domain/models/Document.ts
+------------------------------------------------------------------------
+
+[ ] Définir l'interface IDocument avec tous les champs du schema BDD
+
+[ ] Définir DocumentSchema avec Mongoose
+      - Tous les champs typés
+      - status : enum strict
+      - timestamps: true
+      - Valeurs par défaut : status: "pending", retryCount: 0,
+        gridfsFileId: null, errorMessage: null, generationTimeMs: null
+
+[ ] Ajouter méthode statique findByBatchId(batchId: string)
+      - Retourne tous les documents du batch
+      - Projection : documentId, userId, status, fileSize,
+        errorMessage, generationTimeMs (exclure gridfsFileId)
+      - Trié par createdAt ASC
+
+[ ] Ajouter méthode statique countByBatchAndStatus(batchId: string)
+      - Retourne un objet { pending, processing, completed, failed }
+      - Utilise MongoDB aggregation $group + $sum pour une seule requête
+
+[ ] Exporter DocumentModel et l'interface IDocument
+
+------------------------------------------------------------------------
+1.4 — GridFS Storage
+Fichier : /src/infrastructure/storage/gridfsStorage.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter initBucket(): GridFSBucket
+      - Crée un bucket nommé "pdfs" avec mongoose.connection.db
+      - Pattern Singleton : ne crée qu'une seule instance
+      - Lance une erreur si appelé avant la connexion MongoDB
+
+[ ] Implémenter uploadStream(filename, metadata): GridFSBucketWriteStream
+      - Retourne un WriteStream vers GridFS
+      - Configure chunkSizeBytes: 261120
+      - Injecte les métadonnées : documentId, batchId, userId, generatedAt
+      - IMPORTANT : ne charge jamais le PDF en mémoire
+        → le générateur PDF pipe directement dans ce stream
+
+[ ] Implémenter downloadStream(fileId): GridFSBucketReadStream
+      - Retourne un ReadStream depuis GridFS
+      - Utilisé par le contrôleur pour pipe vers la réponse HTTP
+      - Lance GridFSFileNotFoundError si le fileId n'existe pas
+
+[ ] Implémenter deleteFile(fileId): Promise<void>
+      - Supprime un fichier GridFS par son ObjectId
+      - Utilisé lors des retries si un fichier partiel existe déjà
+      - Ignore silencieusement si le fichier n'existe pas (idempotent)
+
+[ ] Implémenter getFileInfo(fileId): Promise<GridFSFile | null>
+      - Retourne les métadonnées du fichier (taille, date, metadata)
+      - Retourne null si non trouvé
+
+
+================================================================================
+  PHASE 2 — QUEUE ET STRATÉGIE FALLBACK
+================================================================================
+
+------------------------------------------------------------------------
+2.1 — Interface commune (Pattern Strategy)
+Fichier : /src/infrastructure/queue/queueAdapter.ts
+------------------------------------------------------------------------
+
+[ ] Définir l'interface IQueueAdapter :
+      add(jobName, data, opts?): Promise<string>    — retourne jobId
+      process(jobName, concurrency, handler): void
+      getQueueSize(): Promise<number>
+      close(): Promise<void>
+      isHealthy(): Promise<boolean>
+
+[ ] Définir les types JobData et JobOptions :
+      JobData : { documentId: string, userId: string, batchId: string }
+      JobOptions : { attempts?: number, backoff?: BackoffOptions }
+
+[ ] Implémenter QueueFactory.create(): IQueueAdapter
+      - Tente un ping Redis (timeout 2s)
+      - Si Redis disponible → instancie et retourne BullQueueAdapter
+      - Si Redis indisponible → instancie MemoryQueueAdapter
+        + log WARNING "Redis indisponible, fallback mémoire activé"
+
+------------------------------------------------------------------------
+2.2 — Bull Queue Adapter
+Fichier : /src/infrastructure/queue/bullConfig.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter BullQueueAdapter qui implémente IQueueAdapter
+
+[ ] Implémenter add(jobName, data, opts):
+      - Appelle queue.add(jobName, data, {
+          ...opts,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 1000 }
+          removeOnComplete: 100,    — garde les 100 derniers jobs réussis
+          removeOnFail: 50          — garde les 50 derniers jobs échoués
+        })
+      - Retourne job.id.toString()
+
+[ ] Implémenter process(jobName, concurrency, handler):
+      - Appelle queue.process(jobName, concurrency, handler)
+      - Configure les event listeners :
+          on('completed') : log info + incrémenter métrique Prometheus
+          on('failed')    : log error avec jobId, erreur, tentatives
+          on('stalled')   : log warning (job bloqué)
+
+[ ] Implémenter getQueueSize():
+      - Retourne waiting + active count
+      - Appel : queue.getWaitingCount() + queue.getActiveCount()
+
+[ ] Implémenter close():
+      - Appelle queue.close() qui attend la fin des jobs actifs
+      - Timeout de 30s max avant de forcer la fermeture
+
+[ ] Implémenter isHealthy():
+      - Exécute queue.client.ping()
+      - Retourne true si réponse "PONG", false sinon
+      - Timeout 1s sur le ping
+
+------------------------------------------------------------------------
+2.3 — Memory Queue Adapter (Fallback Redis Down)
+Fichier : /src/infrastructure/queue/memoryQueue.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter MemoryQueueAdapter qui implémente IQueueAdapter
+      - Utilise un Array<{ id, jobName, data }> comme file FIFO
+
+[ ] Implémenter add(jobName, data):
+      - Génère un UUID local comme jobId
+      - Push dans le tableau
+      - Retourne le jobId
+      - Log WARNING à chaque ajout pour alerter le fallback est actif
+
+[ ] Implémenter process(jobName, concurrency, handler):
+      - setInterval toutes les 500ms
+      - Dépile "concurrency" jobs à la fois du tableau
+      - Appelle handler pour chaque job
+      - Gère les erreurs sans crasher la boucle
+
+[ ] Implémenter getQueueSize():
+      - Retourne this.queue.length
+
+[ ] Implémenter isHealthy():
+      - Retourne toujours true (pas de dépendance externe)
+
+[ ] Implémenter close():
+      - Vide l'intervalle (clearInterval)
+      - Retourne Promise.resolve()
+
+
+================================================================================
+  PHASE 3 — DOMAIN SERVICES (Logique Métier)
+================================================================================
+
+------------------------------------------------------------------------
+3.1 — BatchService
+Fichier : /src/domain/services/batchService.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter createBatch(userIds: string[]): Promise<IBatch>
+      OBJECTIF : < 100ms de temps de réponse API
+
+      Étape 1 — Validation métier :
+        - Vérifier userIds.length === 1000
+        - Throw ValidationError si différent
+        - (La validation Zod du contrôleur l'a déjà vérifié,
+           mais le service doit être indépendant)
+
+      Étape 2 — Générer les IDs :
+        - Générer batchId avec uuid.v4()
+        - Générer 1000 documentId avec uuid.v4() (un par userId)
+
+      Étape 3 — Bulk insert des 1000 documents :
+        - Construire un tableau de 1000 objets Document
+        - Appeler DocumentModel.insertMany(docs, { ordered: false })
+        - "ordered: false" = continue même si un doc échoue l'insertion
+        - BEAUCOUP plus rapide que 1000 appels save() individuels
+
+      Étape 4 — Créer l'entrée Batch :
+        - BatchModel.create({ batchId, status: "pending",
+            totalDocuments: 1000, processedCount: 0,
+            failedCount: 0, userIds, ... })
+
+      Étape 5 — Enqueue les jobs :
+        - Appeler queueService.enqueueDocuments(documents, batchId)
+
+      Étape 6 — Mettre à jour le status :
+        - BatchModel.findOneAndUpdate({ batchId },
+            { status: "processing" })
+
+      Étape 7 — Retourner le batch créé
+
+[ ] Implémenter getBatchStatus(batchId: string): Promise<BatchStatusDTO>
+      - Appeler BatchModel.findByBatchId(batchId)
+      - Throw NotFoundError si null
+      - Appeler DocumentModel.findByBatchId(batchId)
+      - Construire et retourner le DTO :
+          {
+            batchId, status, totalDocuments,
+            processedCount, failedCount,
+            completedAt, createdAt,
+            documents: [{ documentId, userId, status,
+                          fileSize, errorMessage, generationTimeMs }]
+          }
+
+[ ] Implémenter updateBatchProgress(batchId, isSuccess): Promise<void>
+      APPELÉ PAR LE WORKER après chaque document traité
+
+      - Utiliser $inc atomique MongoDB :
+          BatchModel.findOneAndUpdate(
+            { batchId },
+            { $inc: { [isSuccess ? 'processedCount' : 'failedCount']: 1 } },
+            { new: true }
+          )
+      - Vérifier si le batch est terminé via isComplete()
+      - Si terminé :
+          Déterminer le status final :
+            "completed" si failedCount === 0
+            "failed" si tous ont échoué
+            "completed" (partiel) si certains ont réussi
+          Mettre à jour status + completedAt
+          Observer la métrique batch_processing_duration_seconds
+      - Incrémenter metrics.documentsGeneratedTotal avec label
+        status: isSuccess ? "success" : "failed"
+
+------------------------------------------------------------------------
+3.2 — DocumentService
+Fichier : /src/domain/services/documentService.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter getDocument(documentId): Promise<DocumentWithStream>
+      - DocumentModel.findOne({ documentId })
+      - Throw NotFoundError si null
+      - Throw DocumentNotReadyError si status !== "completed"
+      - Throw DocumentNotReadyError si gridfsFileId === null
+      - Appeler gridfsStorage.downloadStream(gridfsFileId)
+      - Retourner { document, stream }
+      - Le stream est pipé vers res par le contrôleur
+
+[ ] Implémenter updateDocumentStatus(documentId, status, data?): Promise<void>
+      - Mise à jour MongoDB du document
+      - Champs optionnels : gridfsFileId, fileSize, errorMessage,
+        generationTimeMs, retryCount (via $inc)
+      - Toujours mettre à jour updatedAt (géré par timestamps)
+
+------------------------------------------------------------------------
+3.3 — QueueService
+Fichier : /src/domain/services/queueService.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter enqueueDocuments(documents, batchId): Promise<void>
+      - Construire un tableau de 1000 JobData :
+          { documentId, userId, batchId }
+      - Enqueuer par chunks de 100 pour ne pas bloquer l'event loop :
+          for (const chunk of chunks(documents, 100)) {
+            await Promise.all(chunk.map(doc => queueAdapter.add(...)))
+          }
+      - Log "X jobs enqueués pour le batch Y"
+      - Si une erreur survient : logger + throw pour rollback dans createBatch
+
+
+================================================================================
+  PHASE 4 — API (PRODUCER)
+================================================================================
+
+------------------------------------------------------------------------
+4.1 — Validation Middleware
+Fichier : /src/api/middlewares/validate.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter validateBatchRequest (middleware Express)
+      - Schéma Zod :
+          z.object({
+            userIds: z.array(z.string().uuid()).length(1000)
+          })
+      - Si invalide → res.status(400).json({
+            error: "Validation échouée",
+            details: errors   — liste des champs invalides
+          })
+      - Si valide → attacher à req.validatedBody et appeler next()
+
+[ ] Implémenter validateUUIDParam(paramName: string) (middleware factory)
+      - Vérifie que req.params[paramName] est un UUID v4 valide
+      - Si invalide → res.status(400).json({ error: "ID invalide" })
+
+------------------------------------------------------------------------
+4.2 — Rate Limiter
+Fichier : /src/api/middlewares/rateLimiter.ts
+------------------------------------------------------------------------
+
+[ ] Configurer batchRateLimiter avec express-rate-limit
+      - windowMs: 15 * 60 * 1000    — 15 minutes
+      - max: 10                       — 10 requêtes max par IP
+      - message JSON : { error: "Trop de requêtes", retryAfter: X }
+      - standardHeaders: true
+      - legacyHeaders: false
+
+------------------------------------------------------------------------
+4.3 — Error Handler Global
+Fichier : /src/api/middlewares/errorHandler.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter le middleware d'erreur global (err, req, res, next)
+      - Gérer les types d'erreurs :
+          ValidationError      → 400 Bad Request
+          NotFoundError        → 404 Not Found
+          DocumentNotReadyError → 202 Accepted (en cours de génération)
+          CircuitOpenError     → 503 Service Unavailable
+          Error générique      → 500 Internal Server Error
+      - Logger chaque erreur :
+          logger.error({ err, batchId: req.params.batchId,
+                         documentId: req.params.documentId,
+                         path: req.path, method: req.method })
+      - Réponse JSON uniformisée :
+          { error: string, code: string, requestId: string }
+      - Ne jamais exposer les stack traces en production
+
+------------------------------------------------------------------------
+4.4 — BatchController
+Fichier : /src/api/controllers/batchController.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter createBatch(req, res, next): Promise<void>
+      - Extraire userIds depuis req.validatedBody
+      - Appeler batchService.createBatch(userIds)
+      - Répondre IMMÉDIATEMENT 202 Accepted :
+          res.status(202).json({
+            batchId: batch.batchId,
+            status: "pending",
+            message: "Batch créé, traitement en cours",
+            estimatedTime: "~30s pour 1000 documents"
+          })
+      - Propager les erreurs via next(err)
+
+[ ] Implémenter getBatchStatus(req, res, next): Promise<void>
+      - Extraire batchId depuis req.params
+      - Appeler batchService.getBatchStatus(batchId)
+      - Répondre 200 OK avec le DTO complet
+      - NotFoundError → géré par errorHandler → 404
+
+------------------------------------------------------------------------
+4.5 — DocumentController
+Fichier : /src/api/controllers/documentController.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter getDocument(req, res, next): Promise<void>
+      - Extraire documentId depuis req.params
+      - Appeler documentService.getDocument(documentId)
+      - Configurer les headers HTTP :
+          Content-Type: application/pdf
+          Content-Disposition: attachment; filename="${documentId}.pdf"
+          Content-Length: document.fileSize (si connu)
+          Cache-Control: private, max-age=3600
+      - PIPE du ReadStream GridFS directement vers res :
+          stream.pipe(res)
+      - Écouter stream.on('error', next) pour propager les erreurs
+      - NE PAS charger le PDF en mémoire (pas de Buffer intermédiaire)
+
+------------------------------------------------------------------------
+4.6 — Routes
+Fichier : /src/api/routes/batchRoutes.ts
+------------------------------------------------------------------------
+
+[ ] POST  /api/documents/batch
+      Middlewares : [batchRateLimiter, validateBatchRequest]
+      Handler     : batchController.createBatch
+
+[ ] GET   /api/documents/batch/:batchId
+      Middlewares : [validateUUIDParam('batchId')]
+      Handler     : batchController.getBatchStatus
+
+Fichier : /src/api/routes/documentRoutes.ts
+
+[ ] GET   /api/documents/:documentId
+      Middlewares : [validateUUIDParam('documentId')]
+      Handler     : documentController.getDocument
+
+
+================================================================================
+  PHASE 5 — WORKER (CONSUMER)
+================================================================================
+
+------------------------------------------------------------------------
+5.1 — PDF Processor (s'exécute dans le Worker Thread)
+Fichier : /src/workers/processors/pdfProcessor.ts
+------------------------------------------------------------------------
+
+[ ] Ce fichier est le "worker file" de Piscina
+      Il tourne dans un thread isolé, sans accès à l'event loop principal
+
+[ ] Implémenter generatePdf(data: PdfJobData): Promise<Buffer>
+      data : { userId, documentId, batchId }
+
+      Étape 1 — Récupérer le template compilé depuis le cache :
+        - Appeler getTemplate('cerfa') (voir cache ci-dessous)
+
+      Étape 2 — Générer le PDF avec PDFKit en mode streaming :
+        - const doc = new PDFDocument({ bufferPages: false })
+        - const chunks: Buffer[] = []
+        - doc.on('data', chunk => chunks.push(chunk))
+        - Remplir le PDF : en-tête, logo fictif, titre, identité userId,
+          champs CERFA/convention simulés, pied de page (documentId + date)
+        - doc.end()
+
+      Étape 3 — Appliquer le timeout de 5 secondes :
+        - Utiliser Promise.race([
+            new Promise<Buffer>(resolve => doc.on('end', () =>
+              resolve(Buffer.concat(chunks)))),
+            new Promise((_, reject) => setTimeout(() =>
+              reject(new PdfTimeoutError('Timeout 5s dépassé')), 5000))
+          ])
+
+      Étape 4 — Retourner le Buffer
+
+[ ] Implémenter le cache de templates (module-level Map) :
+      const templateCache = new Map<string, CompiledTemplate>()
+
+      getTemplate(type: string): CompiledTemplate
+        - Si présent dans templateCache → retourner directement (0ms)
+        - Si absent → "compiler" le template (charger depuis disque,
+          parser, stocker), insérer dans le cache, retourner
+        - Principe : compiler une fois, réutiliser N fois
+
+------------------------------------------------------------------------
+5.2 — Worker Pool (Piscina)
+Fichier : /src/workers/workerPool.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter initPool(): Piscina
+      - Créer instance Piscina :
+          new Piscina({
+            filename: path.resolve(__dirname, './processors/pdfProcessor'),
+            maxThreads: os.cpus().length,
+            minThreads: 2,
+            idleTimeout: 30000
+          })
+      - Singleton : ne créer qu'une instance par processus
+
+[ ] Implémenter runTask(data: PdfJobData): Promise<Buffer>
+      - Appeler pool.run(data)
+      - En cas d'erreur Piscina : logger et relancer l'erreur
+
+[ ] Implémenter getStats(): PoolStats
+      - Retourner {
+          utilization: pool.utilization,
+          queueSize: pool.queueSize,
+          threads: pool.threads.length
+        }
+      - Utilisé pour la métrique Prometheus worker_pool_utilization
+
+[ ] Implémenter destroy(): Promise<void>
+      - Appeler pool.destroy()
+      - Attend la fin des tâches en cours
+      - Appelé dans le Graceful Shutdown
+
+------------------------------------------------------------------------
+5.3 — Point d'entrée du Worker
+Fichier : /src/worker.ts
+------------------------------------------------------------------------
+
+[ ] Au démarrage :
+      - Initialiser la connexion MongoDB (mongoConnection.connect())
+      - Initialiser QueueFactory (BullQueueAdapter ou MemoryQueueAdapter)
+      - Initialiser le pool Piscina (initPool())
+      - Logger "Worker démarré, en attente de jobs..."
+
+[ ] S'abonner à la queue :
+      queueAdapter.process('generate-pdf', WORKER_CONCURRENCY, processPdfJob)
+
+[ ] Implémenter processPdfJob(job: Bull.Job): Promise<void>
+      Données du job : { documentId, userId, batchId }
+
+      ÉTAPE 1 — Marquer le document en cours :
+        documentService.updateDocumentStatus(documentId, "processing")
+        logger.info({ documentId, batchId, msg: "Génération démarrée" })
+
+      ÉTAPE 2 — Démarrer le timer :
+        const startTime = Date.now()
+
+      ÉTAPE 3 — Générer le PDF via le Worker Thread :
+        const pdfBuffer = await workerPool.runTask({ userId, documentId, batchId })
+
+      ÉTAPE 4 — Uploader vers GridFS en streaming :
+        const uploadStream = gridfsStorage.uploadStream(
+          `${documentId}.pdf`,
+          { documentId, batchId, userId, generatedAt: new Date() }
+        )
+        Promisifier le stream :
+          await new Promise((resolve, reject) => {
+            const readable = Readable.from(pdfBuffer)
+            readable.pipe(uploadStream)
+            uploadStream.on('finish', resolve)
+            uploadStream.on('error', reject)
+          })
+
+      ÉTAPE 5 — Récupérer l'ID GridFS et la taille :
+        const fileId = uploadStream.id
+        const fileSize = pdfBuffer.length
+
+      ÉTAPE 6 — Mettre à jour le document en "completed" :
+        documentService.updateDocumentStatus(documentId, "completed", {
+          gridfsFileId: fileId,
+          fileSize,
+          generationTimeMs: Date.now() - startTime
+        })
+
+      ÉTAPE 7 — Notifier le BatchService :
+        batchService.updateBatchProgress(batchId, true)
+        logger.info({ documentId, batchId,
+                      generationTimeMs: Date.now() - startTime,
+                      msg: "PDF généré avec succès" })
+
+      GESTION D'ERREUR (dans le catch) :
+        - Logger l'erreur : logger.error({ documentId, batchId, err })
+        - Incrémenter retryCount sur le document :
+            documentService.updateDocumentStatus(documentId, "failed", {
+              errorMessage: err.message,
+              retryCount: job.attemptsMade + 1
+            })
+        - Si job.attemptsMade >= 2 (3ème tentative = finale) :
+            Notifier batchService.updateBatchProgress(batchId, false)
+        - Relancer l'erreur (throw err) pour que Bull gère le retry
+
+[ ] Implémenter le Graceful Shutdown :
+      process.on('SIGTERM', async () => {
+        logger.info('SIGTERM reçu, arrêt gracieux en cours...')
+        await queueAdapter.close()       — finit les jobs en cours
+        await workerPool.destroy()       — attend la fin des threads
+        await mongoConnection.disconnect()
+        logger.info('Worker arrêté proprement')
+        process.exit(0)
+      })
+
+
+================================================================================
+  PHASE 6 — PERFORMANCES
+================================================================================
+
+------------------------------------------------------------------------
+6.1 — Cache des Templates PDF
+------------------------------------------------------------------------
+
+[ ] Dans pdfProcessor.ts, définir le cache au niveau du module :
+      const templateCache = new Map<string, CompiledTemplate>()
+      → Ce cache persiste pendant toute la durée de vie du thread
+      → Chaque thread a son propre cache (pas de partage inter-threads)
+      → Première génération : compile le template (~quelques ms)
+      → Toutes les suivantes : 0ms de compilation
+
+------------------------------------------------------------------------
+6.2 — Bulk Insert des 1000 Documents
+------------------------------------------------------------------------
+
+[ ] Dans batchService.createBatch(), utiliser insertMany :
+      DocumentModel.insertMany(documents, { ordered: false })
+      → ordered: false = continue même si un document échoue
+      → Résultat : ~1 requête MongoDB pour 1000 inserts
+      → Vs : 1000 requêtes individuelles (100x plus lent)
+
+------------------------------------------------------------------------
+6.3 — Concurrence configurable
+------------------------------------------------------------------------
+
+[ ] Variable WORKER_CONCURRENCY dans .env (défaut : 10)
+[ ] Ne jamais dépasser os.cpus().length * 2 pour éviter le context switching
+[ ] Documenter dans le README le réglage optimal selon le hardware
+
+------------------------------------------------------------------------
+6.4 — Script de Benchmark
+Fichier : /benchmark/run.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter runBenchmark(): Promise<BenchmarkReport>
+
+      Étape 1 — Préparer 1000 UUIDs aléatoires
+      Étape 2 — Envoyer POST /api/documents/batch
+                Enregistrer startTime = Date.now()
+      Étape 3 — Polling toutes les 2s sur GET /batch/:batchId
+                Logger à chaque poll : processedCount, failedCount, docs/s
+      Étape 4 — Boucler jusqu'à status === "completed" ou "failed"
+      Étape 5 — Calculer :
+                  totalTimeMs  = Date.now() - startTime
+                  docsPerSecond = 1000 / (totalTimeMs / 1000)
+                  peakMemoryMB = process.memoryUsage().heapUsed / 1024 / 1024
+      Étape 6 — Générer le rapport :
+                  {
+                    totalTimeMs, docsPerSecond, peakMemoryMB,
+                    failedCount, successCount,
+                    timeline: [{ timestamp, processed, docsPerSec }]
+                  }
+      Étape 7 — Écrire le rapport en JSON dans /benchmark/report.json
+                et en format texte dans /benchmark/report.txt
+
+[ ] Inclure le rapport dans le README (résultats sur la machine de dev)
+
+
+================================================================================
+  PHASE 7 — RÉSILIENCE
+================================================================================
+
+------------------------------------------------------------------------
+7.1 — Circuit Breaker (DocuSign simulé)
+Fichier : /src/infrastructure/circuitBreaker.ts
+------------------------------------------------------------------------
+
+[ ] Installer la librairie "opossum"
+
+[ ] Implémenter createCircuitBreaker(fn, options): CircuitBreaker
+      Options :
+        timeout: 3000               — 3s max par appel
+        errorThresholdPercentage: 50 — ouvre si 50% d'erreurs
+        resetTimeout: 30000         — réessaye après 30s
+
+[ ] Écouter les events du circuit breaker :
+      on('open')     : logger.warn("Circuit ouvert, service dégradé")
+      on('halfOpen') : logger.info("Circuit semi-ouvert, test en cours")
+      on('close')    : logger.info("Circuit fermé, service rétabli")
+
+[ ] Créer docuSignCircuitBreaker wrappant la fonction simulée DocuSign
+[ ] Si circuit ouvert → throw CircuitOpenError avec message explicite
+
+------------------------------------------------------------------------
+7.2 — Health Checks
+Fichier : /src/infrastructure/monitoring/healthcheck.ts
+------------------------------------------------------------------------
+
+[ ] Implémenter checkMongo(): Promise<HealthStatus>
+      - Exécuter mongoose.connection.db.admin().ping()
+      - Mesurer la latence
+      - Timeout 2s
+      - Retourner { status: "up"|"down", latencyMs }
+
+[ ] Implémenter checkRedis(): Promise<HealthStatus>
+      - Exécuter redisClient.ping()
+      - Mesurer la latence
+      - Timeout 2s
+      - Retourner { status: "up"|"down", latencyMs }
+
+[ ] Implémenter checkQueue(): Promise<HealthStatus>
+      - Appeler queueAdapter.isHealthy()
+      - Appeler queueAdapter.getQueueSize()
+      - Retourner { status: "up"|"down", queueSize }
+
+[ ] Route GET /health dans app.ts :
+      - Appeler les 3 checks via Promise.allSettled()
+      - Si tous "up"  → 200 : { status: "healthy", checks: {...} }
+      - Si un "down"  → 503 : { status: "degraded", checks: {...} }
+      - Inclure timestamp et version de l'app
+
+------------------------------------------------------------------------
+7.3 — Gestion MongoDB indisponible
+------------------------------------------------------------------------
+
+[ ] Retry avec backoff exponentiel dans mongoConnection.connect()
+      Tentative 1 : attendre 1s
+      Tentative 2 : attendre 2s
+      Tentative 3 : attendre 4s
+      Tentative 4 : attendre 8s
+      Tentative 5 : attendre 16s → abandon + process.exit(1)
+
+[ ] Flag isMongoAvailable consulté par l'error handler
+      Si false → tous les endpoints retournent 503 directement
+
+------------------------------------------------------------------------
+7.4 — Timeout PDF (5 secondes max)
+------------------------------------------------------------------------
+
+[ ] Dans pdfProcessor.ts, utiliser Promise.race() :
+      Promise.race([
+        generatePdfInternal(data),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new PdfTimeoutError()), PDF_TIMEOUT_MS))
+      ])
+[ ] PDF_TIMEOUT_MS configurable via env (défaut : 5000)
+[ ] En cas de timeout : le job Bull est marqué failed → retry automatique
+
+
+================================================================================
+  PHASE 8 — OBSERVABILITÉ
+================================================================================
+
+------------------------------------------------------------------------
+8.1 — Logs Structurés
+Fichier : /src/config/logger.ts
+------------------------------------------------------------------------
+
+[ ] Winston avec format JSON obligatoire :
+      Champs fixes   : timestamp, level, message, service: "batch-api"
+      Champs optionnels : batchId, documentId, userId,
+                          durationMs, statusCode, method, path, error
+
+[ ] Transports :
+      En développement : Console avec couleurs
+      En production    : Fichier JSON + Console JSON
+
+[ ] Implémenter createRequestLogger() middleware Express :
+      - Intercepte chaque requête entrante et sortante
+      - Log : { method, path, statusCode, durationMs, ip, userAgent }
+      - N'inclure jamais le body dans les logs (protection données)
+
+[ ] Corrélation des logs :
+      - Extraire batchId et documentId des params
+      - Créer un logger enfant avec ces champs pour chaque requête
+      - Injecter dans req.logger pour usage dans les controllers
+
+------------------------------------------------------------------------
+8.2 — Métriques Prometheus
+Fichier : /src/infrastructure/monitoring/prometheus.ts
+------------------------------------------------------------------------
+
+[ ] Initialiser prom-client :
+      import { Registry, collectDefaultMetrics } from 'prom-client'
+      const register = new Registry()
+      collectDefaultMetrics({ register })
+      — Inclut automatiquement : CPU, mémoire, event loop lag,
+        handles actifs, requêtes GC
+
+[ ] Créer documents_generated_total (Counter) :
+      Labels : status ("success" | "failed")
+      Incrémenter dans batchService.updateBatchProgress()
+      Exemple de requête PromQL :
+        rate(documents_generated_total[1m])  — débit en docs/s
+
+[ ] Créer batch_processing_duration_seconds (Histogram) :
+      Mesure le temps total de traitement d'un batch complet
+      Buckets : [1, 5, 10, 30, 60, 120, 300]
+      Observer dans updateBatchProgress quand le batch se termine
+
+[ ] Créer queue_size (Gauge) :
+      Valeur actuelle des jobs en attente
+      Mise à jour toutes les 5s via setInterval :
+        setInterval(async () => {
+          gauge.set(await queueAdapter.getQueueSize())
+        }, 5000)
+
+[ ] Créer pdf_generation_duration_seconds (Histogram) :
+      Mesure la durée de génération d'un PDF individuel (worker thread)
+      Buckets : [0.1, 0.5, 1, 2, 5]
+      Observer dans processPdfJob après chaque génération réussie
+
+[ ] Créer worker_pool_utilization (Gauge) :
+      Utilisation du pool Piscina (0 à 1)
+      Mise à jour toutes les 5s via workerPool.getStats().utilization
+
+[ ] Route GET /metrics dans app.ts :
+      res.set('Content-Type', register.contentType)
+      res.send(await register.metrics())
+
+------------------------------------------------------------------------
+8.3 — Dashboard (documentation des métriques clés)
+------------------------------------------------------------------------
+
+[ ] Créer dashboard.md avec les requêtes PromQL utiles :
+      Débit en temps réel :
+        rate(documents_generated_total{status="success"}[1m])
+      Taux d'erreur :
+        rate(documents_generated_total{status="failed"}[1m])
+        / rate(documents_generated_total[1m])
+      Durée P99 d'un batch :
+        histogram_quantile(0.99, batch_processing_duration_seconds_bucket)
+      Alerte backpressure :
+        queue_size > 100
+      Utilisation CPU du pool :
+        worker_pool_utilization > 0.9
+
+
+================================================================================
+  PHASE 9 — DOCUMENTATION
+================================================================================
+
+------------------------------------------------------------------------
+9.1 — Swagger / OpenAPI
+------------------------------------------------------------------------
+
+[ ] Installer swagger-ui-express + swagger-jsdoc
+
+[ ] Documenter POST /api/documents/batch :
+      requestBody : { userIds: string[] (exactly 1000 UUIDs) }
+      responses :
+        202 : { batchId: string, status: "pending", message: string }
+        400 : { error: string, details: [...] }
+        429 : { error: "Trop de requêtes", retryAfter: number }
+        500 : { error: string, code: string }
+
+[ ] Documenter GET /api/documents/batch/:batchId :
+      parameters : batchId (UUID v4)
+      responses :
+        200 : objet batch complet avec liste des documents
+        400 : batchId invalide
+        404 : batch non trouvé
+
+[ ] Documenter GET /api/documents/:documentId :
+      parameters : documentId (UUID v4)
+      responses :
+        200 : binary PDF (Content-Type: application/pdf)
+        202 : { message: "Document en cours de génération" }
+        404 : document non trouvé
+
+[ ] Documenter GET /health et GET /metrics
+
+[ ] Exposer Swagger UI à /api-docs
+
+------------------------------------------------------------------------
+9.2 — README.md
+------------------------------------------------------------------------
+
+[ ] Badge GitHub Actions (CI status)
+
+[ ] Section "Architecture" avec diagramme ASCII du flux Producer-Consumer :
+      Client → API (Producer) → MongoDB → Bull Queue → Worker (Consumer)
+                                                         ↓
+                                                    Worker Thread (PDF)
+                                                         ↓
+                                                    GridFS (MongoDB)
+
+[ ] Section "Sequence diagram" du traitement d'un batch :
+      1. POST /batch → Validation → insertMany → enqueue 1000 jobs → 202
+      2. Worker dépile → Thread génère PDF → Stream vers GridFS → update DB
+      3. GET /batch/:id → polling status
+      4. GET /documents/:id → stream PDF depuis GridFS
+
+[ ] Section "Justification des choix techniques" :
+      Pourquoi Bull      : retry natif, backoff exponentiel, monitoring,
+                           DLQ intégrée, dashboard Bull Board disponible
+      Pourquoi GridFS    : streaming natif, pas de limite de taille,
+                           intégré MongoDB, pas besoin de S3 externe
+      Pourquoi Piscina   : API plus simple que worker_threads natifs,
+                           pool géré automatiquement, transfert d'objets
+      Pourquoi Strategy  : testabilité (mock facile), résilience (fallback),
+                           extensibilité (ajouter RabbitMQ sans changer le code)
+
+[ ] Instructions de déploiement :
+      docker-compose up --build
+      Variables d'environnement documentées
+
+[ ] Collection de commandes curl pour tester chaque endpoint
+
+[ ] Rapport de benchmark intégré (résultats mesurés)
+
+
+================================================================================
+  PHASE 10 — SÉCURITÉ ET QUALITÉ
+================================================================================
+
+[ ] Ajouter helmet() pour les headers HTTP de sécurité
+      - X-Content-Type-Options: nosniff
+      - X-Frame-Options: DENY
+      - Strict-Transport-Security
+
+[ ] Validation stricte de tous les inputs via Zod
+      Aucune donnée brute ne doit atteindre la base de données
+
+[ ] Ne jamais logger de données sensibles
+      - Pas de tokens, secrets, mots de passe dans les logs
+      - Pas de corps de requête brut
+
+[ ] Gérer les secrets via variables d'environnement uniquement
+      Aucune valeur hardcodée dans le code source
+
+[ ] npm audit sans vulnérabilités critiques ou hautes
+
+[ ] Tests unitaires (Jest) :
+      [ ] batchService.createBatch() avec mock Mongoose
+      [ ] batchService.updateBatchProgress() avec $inc atomique
+      [ ] documentService.getDocument() cas happy path
+      [ ] documentService.getDocument() cas document non prêt
+      [ ] MemoryQueueAdapter : add(), process(), getQueueSize()
+      [ ] BullQueueAdapter : isHealthy() cas Redis down
+      [ ] pdfProcessor.generatePdf() cas timeout
+
+[ ] Test d'intégration :
+      [ ] Flux complet : POST batch → poll status → GET document PDF
+          avec MongoDB et Redis en mémoire (mongodb-memory-server, ioredis-mock)
+
+
+================================================================================
+  PHASE 11 — DÉPLOIEMENT
+================================================================================
+
+------------------------------------------------------------------------
+docker-compose.yml
+------------------------------------------------------------------------
+
+[ ] Service "mongodb" :
+      image: mongo:7
+      volumes: mongo-data:/data/db (persistant)
+      healthcheck: mongosh --eval "db.adminCommand('ping')"
+      environment: MONGO_INITDB_DATABASE=batchdocs
+
+[ ] Service "redis" :
+      image: redis:7-alpine
+      command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+      healthcheck: redis-cli ping
+
+[ ] Service "api" :
+      build: Dockerfile (multi-stage : build TypeScript → image légère)
+      ports: 3000:3000
+      depends_on: [mongodb, redis]
+      environment: via .env
+      restart: unless-stopped
+
+[ ] Service "worker" :
+      build: même Dockerfile, commande différente : node dist/worker.js
+      depends_on: [mongodb, redis]
+      deploy.replicas: 1 (scalable avec --scale worker=3)
+      restart: unless-stopped
+
+[ ] Volume nommé "mongo-data" pour la persistance MongoDB
+[ ] Réseau Docker "app-network" pour l'isolation
+
+------------------------------------------------------------------------
+CI/CD — GitHub Actions
+------------------------------------------------------------------------
+
+[ ] Workflow .github/workflows/ci.yml :
+      Déclencheur : push sur main et pull requests
+      Étapes :
+        1. Checkout du code
+        2. Setup Node.js 20
+        3. npm ci (install propre)
+        4. npm run lint (ESLint)
+        5. npm run build (TypeScript → vérif compilation)
+        6. npm test (Jest)
+        7. docker build (vérif que l'image se construit)
+
+[ ] Déploiement sur Render.com (ou Railway) :
+      - API déployée en service web
+      - Worker déployé en background worker
+      - MongoDB Atlas en cloud
+      - Redis Cloud (Upstash)
+      - URL publique de l'API dans le README
+
+
+================================================================================
+  RÉCAPITULATIF DES TÂCHES PAR PHASE
+================================================================================
+
+PHASE 0  — Setup projet                          [30 min]
+PHASE 1  — Base de données & Infrastructure      [1h30]
+PHASE 2  — Queue & Fallback Strategy             [1h]
+PHASE 3  — Domain Services                       [1h30]
+PHASE 4  — API Producer                          [1h30]
+PHASE 5  — Worker Consumer                       [2h]
+PHASE 6  — Performances & Benchmark              [1h30]
+PHASE 7  — Résilience                            [1h30]
+PHASE 8  — Observabilité                         [1h]
+PHASE 9  — Documentation                         [1h30]
+PHASE 10 — Sécurité & Tests                      [1h]
+PHASE 11 — Docker & CI/CD                        [30 min]
+------------------------------------------------------
+TOTAL ESTIMÉ                                     ~16h
+
+
+================================================================================
+  CRITÈRES D'ÉVALUATION (rappel du sujet)
+================================================================================
+
+[ ] 1. Fonctionnalité  : Tous les endpoints fonctionnent
+[ ] 2. Architecture    : Clean Architecture, séparation Producer/Consumer
+[ ] 3. Performance     : < 100ms pour POST /batch, benchmark fourni
+[ ] 4. Résilience      : Retry, fallback Redis, circuit breaker, graceful shutdown
+[ ] 5. Tests           : Unitaires + intégration avec couverture correcte
+[ ] 6. Documentation   : README clair, Swagger complet, diagrammes
+[ ] 7. Qualité code    : TypeScript strict, ESLint, pas de any
+[ ] 8. Sécurité        : Validation Zod, helmet, rate limiting, pas de secrets hardcodés
+[ ] 9. Délivrabilité   : "docker-compose up" → tout fonctionne
+
+================================================================================
+  FIN DU TODO
+================================================================================

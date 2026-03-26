@@ -1,0 +1,7 @@
+=== BENCHMARK REPORT ===
+Date           : 2026-03-26T19:06:12.468Z
+Durée totale   : 8697ms
+Débit moyen    : 115 docs/s
+Succès         : 0/1000
+Échecs         : 0/1000
+Mémoire peak   : 85 MB
