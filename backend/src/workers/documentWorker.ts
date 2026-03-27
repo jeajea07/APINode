@@ -129,13 +129,17 @@ async function initWorker(): Promise<void> {
   const execArgv =
     filename === workerPathTs && !fs.existsSync(workerPathJs) ? ["-r", "ts-node/register"] : undefined;
 
-  const maxThreads = Number(process.env.PDF_PISCINA_MAX_THREADS ?? os.cpus().length);
-  const minThreads = Number(process.env.PDF_PISCINA_MIN_THREADS ?? 1);
+  const rawMaxThreads = Number(process.env.PDF_PISCINA_MAX_THREADS ?? os.cpus().length);
+  const rawMinThreads = Number(process.env.PDF_PISCINA_MIN_THREADS ?? 1);
+  const maxThreads =
+    Number.isFinite(rawMaxThreads) && rawMaxThreads > 0 ? rawMaxThreads : os.cpus().length;
+  const minThreads =
+    Number.isFinite(rawMinThreads) && rawMinThreads > 0 ? rawMinThreads : 1;
 
   pdfPiscina = new Piscina({
     filename,
     minThreads,
-    maxThreads: Number.isFinite(maxThreads) ? maxThreads : os.cpus().length,
+    maxThreads,
     ...(execArgv ? { execArgv } : {})
   });
 
