@@ -82,6 +82,26 @@ services:
     networks:
       - app-network
 
+  benchmark:
+    build: ./backend
+    command: ["sh", "-lc", "sleep 10 && npm run benchmark"]
+    environment:
+      API_BASE: "http://api:3000"
+    volumes:
+      - ./backend/benchmark:/app/benchmark
+    depends_on:
+      api:
+        condition: service_started
+      worker:
+        condition: service_started
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - app-network
+
 volumes:
   mongo-data:
 

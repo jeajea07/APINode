@@ -88,6 +88,8 @@ URLs:
 - API: `http://localhost:3000`
 - Healthcheck: `GET /health`
 
+Note: le service `benchmark` se lance automatiquement au `docker compose up` et écrit ses rapports dans `backend/benchmark/report.json` et `backend/benchmark/report.txt`.
+
 ## Demarrage en local (dev)
 
 Backend:
