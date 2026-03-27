@@ -23,7 +23,10 @@ batchRouter.post("/api/documents/batch", async (req, res) => {
 
   try {
     const batch = await BatchModel.create({
-      status: "pending"
+      status: "pending",
+      totalDocuments: ids.length,
+      processedCount: 0,
+      failedCount: 0
     });
 
     const batchId = batch._id.toString();
@@ -124,7 +127,13 @@ batchRouter.get("/api/documents/:documentId", async (req, res) => {
 
     downloadStream.on("error", (err) => {
       if (res.headersSent) return;
-      if ((err as any)?.code === "ENOENT") return res.status(404).json({ error: "File not found" });
+      if (
+        err instanceof Error &&
+        "code" in err &&
+        (err as NodeJS.ErrnoException).code === "ENOENT"
+      ) {
+        return res.status(404).json({ error: "File not found" });
+      }
       return res.status(500).json({ error: "Failed to download file" });
     });
 

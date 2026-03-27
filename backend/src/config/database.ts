@@ -1,16 +1,12 @@
 import mongoose from "mongoose";
+import { ENV } from "./env";
 
 let isConnected = false;
 
 export async function connectDatabase(): Promise<void> {
   if (isConnected) return;
 
-  const uri = process.env.MONGODB_URI;
-  if (!uri) {
-    throw new Error("Missing MONGODB_URI environment variable");
-  }
-
-  await mongoose.connect(uri);
+  await mongoose.connect(ENV.MONGO_URI);
   isConnected = true;
 }
 

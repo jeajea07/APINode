@@ -19,6 +19,16 @@ interface BenchmarkReport {
   timeline: TimelineEntry[];
 }
 
+interface BatchStatusResponse {
+  batchId: string;
+  status: string;
+  documents: Array<{
+    documentId: string;
+    status: "pending" | "processing" | "completed" | "failed";
+    generationTimeMs: number | null;
+  }>;
+}
+
 async function runBenchmark(): Promise<void> {
   console.log("=== BENCHMARK — 1000 documents ===\n");
 
@@ -39,49 +49,84 @@ async function runBenchmark(): Promise<void> {
   // Étape 2 — Polling
   const timeline: TimelineEntry[] = [];
   let status = "pending";
+  let lastCompleted = 0;
+  let lastFailed = 0;
+  let lastProcessed = 0;
+  let stagnantPolls = 0;
+  const pollIntervalMs = 2000;
+  const maxNoProgressPolls = Number(process.env.BENCHMARK_MAX_NO_PROGRESS_POLLS ?? 15);
+  const maxDurationMs = Number(process.env.BENCHMARK_TIMEOUT_MS ?? 120000);
 
   while (status !== "completed" && status !== "failed") {
-    await new Promise<void>((resolve) => setTimeout(resolve, 2000));
+    await new Promise<void>((resolve) => setTimeout(resolve, pollIntervalMs));
+
+    const elapsedMs = Date.now() - startTime;
+    if (elapsedMs > maxDurationMs) {
+      throw new Error(
+        `Benchmark timeout after ${maxDurationMs}ms. ` +
+          `Progress: ${lastCompleted + lastFailed}/${ids.length}. ` +
+          `Is the worker running?`
+      );
+    }
 
     const getRes = await fetch(`${API_BASE}/api/documents/batch/${batchId}`);
-    const batch = (await getRes.json()) as {
-      status: string;
-      processedCount: number;
-      failedCount: number;
-      totalDocuments: number;
-    };
+    const batch = (await getRes.json()) as BatchStatusResponse;
 
     status = batch.status;
+    const documents = batch.documents ?? [];
+    const totalDocuments = documents.length;
+    const completed = documents.filter((d) => d.status === "completed").length;
+    const failed = documents.filter((d) => d.status === "failed").length;
+    const processed = completed + failed;
     const elapsedSec = (Date.now() - startTime) / 1000;
-    const processed = batch.processedCount ?? 0;
     const docsPerSec = Math.round(processed / Math.max(1, elapsedSec));
 
     timeline.push({
       timestamp: new Date().toISOString(),
       processed,
-      failed: batch.failedCount ?? 0,
+      failed,
       docsPerSec
     });
 
     console.log(
       `[${Math.round(elapsedSec)}s] status=${status} ` +
-        `processed=${processed}/${batch.totalDocuments} ` +
-        `failed=${batch.failedCount ?? 0} ` +
+        `processed=${processed}/${totalDocuments} ` +
+        `failed=${failed} ` +
         `docs/s=${docsPerSec}`
     );
+
+    lastCompleted = completed;
+    lastFailed = failed;
+    if (processed === lastProcessed) {
+      stagnantPolls += 1;
+    } else {
+      stagnantPolls = 0;
+      lastProcessed = processed;
+    }
+
+    if (stagnantPolls >= maxNoProgressPolls) {
+      throw new Error(
+        `No progress for ${stagnantPolls * pollIntervalMs}ms. ` +
+          `Progress: ${processed}/${totalDocuments}. ` +
+          `Is the worker running?`
+      );
+    }
+    if ((status === "completed" || status === "failed") && processed < totalDocuments) {
+      status = "processing";
+    }
   }
 
   // Étape 3 — Rapport
   const totalTimeMs = Date.now() - startTime;
-  const last = timeline.at(-1);
-  if (!last) throw new Error("No timeline entries collected");
+  if (timeline.length === 0) throw new Error("No timeline entries collected");
+  const totalProcessed = lastCompleted + lastFailed;
 
   const report: BenchmarkReport = {
     totalTimeMs,
-    docsPerSecond: Math.round(1000 / (totalTimeMs / 1000)),
+    docsPerSecond: Math.round(totalProcessed / (totalTimeMs / 1000)),
     peakMemoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-    failedCount: last.failed,
-    successCount: last.processed,
+    failedCount: lastFailed,
+    successCount: lastCompleted,
     timeline
   };
 

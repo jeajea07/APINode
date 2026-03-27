@@ -7,7 +7,11 @@ import type { AddressInfo } from "node:net";
 
 import express, { type Router } from "express";
 import mongoose from "mongoose";
+import { GridFSBucket } from "mongodb";
 import { MongoMemoryServer } from "mongodb-memory-server";
+
+import { BatchModel } from "../models/Batch";
+import { DocumentModel } from "../models/Document";
 
 let mongod: MongoMemoryServer;
 let server: Server;
@@ -99,6 +103,45 @@ test("GET /documents/:id returns 404 when not found", async () => {
   const fakeId = crypto.randomUUID();
   const res = await fetch(`${baseUrl}/api/documents/${fakeId}`);
   assert.equal(res.status, 404);
+});
+
+test("GET /documents/:id returns a PDF when document is completed", async () => {
+  const db = mongoose.connection.db;
+  assert.ok(db);
+
+  const batch = await BatchModel.create({
+    status: "completed",
+    totalDocuments: 1,
+    processedCount: 1,
+    failedCount: 0,
+    completedAt: new Date()
+  });
+
+  const bucket = new GridFSBucket(db);
+  const pdfBuffer = Buffer.from("%PDF-1.4\n%fake\n", "utf8");
+  const uploadStream = bucket.openUploadStream("test.pdf");
+  uploadStream.end(pdfBuffer);
+  await new Promise<void>((resolve, reject) => {
+    uploadStream.on("finish", () => resolve());
+    uploadStream.on("error", (err) => reject(err));
+  });
+
+  const document = await DocumentModel.create({
+    batchId: batch._id,
+    userId: "integ_user_pdf",
+    status: "completed",
+    retryCount: 0,
+    gridfsFileId: uploadStream.id,
+    errorMessage: null,
+    generationTimeMs: 10
+  });
+
+  const res = await fetch(`${baseUrl}/api/documents/${document._id.toString()}`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "application/pdf");
+
+  const body = Buffer.from(await res.arrayBuffer());
+  assert.ok(body.slice(0, 4).toString("utf8") === "%PDF");
 });
 
 test("GET /health returns 200 when mongo is up", async () => {

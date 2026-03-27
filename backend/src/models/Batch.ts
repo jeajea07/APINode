@@ -6,6 +6,10 @@ export type BatchStatus = "pending" | "processing" | "completed" | "failed";
 
 export interface Batch {
   status: BatchStatus;
+  totalDocuments: number;
+  processedCount: number;
+  failedCount: number;
+  completedAt?: Date | null;
   // Nombre de documents liés à ce batch (non persistant).
   documentCount?: number;
   createdAt: Date;
@@ -21,6 +25,27 @@ const batchSchema = new Schema<Batch>(
       default: "pending",
       index: true
     },
+    totalDocuments: {
+      type: Number,
+      required: true,
+      min: 0
+    },
+    processedCount: {
+      type: Number,
+      required: true,
+      default: 0,
+      min: 0
+    },
+    failedCount: {
+      type: Number,
+      required: true,
+      default: 0,
+      min: 0
+    },
+    completedAt: {
+      type: Date,
+      default: null
+    }
   },
   {
     timestamps: true
@@ -40,4 +65,3 @@ batchSchema.statics.countDocumentsForBatch = async function (batchId: Types.Obje
 };
 
 export const BatchModel = model<Batch>("Batch", batchSchema);
-

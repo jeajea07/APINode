@@ -1,6 +1,4 @@
-import dotenv from "dotenv";
 import express from "express";
-import 'dotenv/config';
 import cors from "cors";
 
 import helmet from "helmet";
@@ -17,11 +15,10 @@ import { documentQueue } from "./queues/documentQueue";
 import { logger } from "./config/logger";
 import { register, startQueueSizeGauge, stopQueueSizeGauge } from "./config/prometheus";
 import { openApiSpec } from "./swagger";
+import { ENV } from "./config/env";
 
-dotenv.config();
-
-const PORT = Number(process.env.PORT ?? 3000);
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN ?? "http://localhost:8080";
+const PORT = ENV.PORT;
+const FRONTEND_ORIGIN = ENV.FRONTEND_ORIGIN;
 
 const app = express();
 app.use(
@@ -34,8 +31,8 @@ app.use(express.json());
 app.use(helmet());
 app.use(
   rateLimit({
-    windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS ?? 15 * 60 * 1000),
-    max: Number(process.env.RATE_LIMIT_MAX ?? 200),
+    windowMs: ENV.RATE_LIMIT_WINDOW_MS,
+    max: ENV.RATE_LIMIT_MAX,
     standardHeaders: "draft-7",
     legacyHeaders: false
   })
